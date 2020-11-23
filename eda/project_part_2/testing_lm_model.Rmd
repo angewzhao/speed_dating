@@ -1,0 +1,354 @@
+---
+title: "Testing Linear Regression w/o Homoscedasticity Model"
+author: Angela Zhao
+date: "`r Sys.Date()`"
+output: 
+  github_document:
+    toc: true
+---
+
+```{r setup, include=FALSE,dpi=500}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+# Libraries
+library(tidyverse)
+library(here)
+library(cvTools)
+library(coefplot)
+library(glmnet)
+library(caret)
+
+file_raw_test_data <-
+  here("data/test_data_speed_dating.csv")
+
+recode_race <-
+  c(
+    "1" = "Black", 
+    "2" = "White", 
+    "3" = "Hispanic", 
+    "4" = "API", 
+    "5" = "Indigenous",
+    "6" = "Other"
+  )
+
+
+recode_goal <-
+  c(
+    "1" = 'Seemed_like_a_fun_night_out',   
+    "2" = "To_meet_new_people",
+    "3" = "To_get_a_date", 
+    "4" = "Looking_for_a_serious_relationship",
+    "5" = "To say I did it",
+    "6" = "Other"
+  )
+```
+
+## Reading and cleaning Data
+
+
+```{r}
+test <-
+  file_raw_test_data %>% 
+  read_csv()
+
+
+# Added in the ratings of partner rating you and you rating the partner
+# diff is the avg of partner rating you - avg of you rating the partner
+
+test <-
+  test %>% 
+  mutate_at(
+    vars(
+      career_c, 
+      field_cd,
+      race,
+      race_o,
+      zipcode,
+      go_out,
+      date,
+      goal,
+      met,
+      met_o,
+      samerace,
+      gender,
+      match
+    ), 
+    as.character
+  ) %>% 
+  mutate(
+    field_cd = 
+      case_when(
+        field_cd %in% c("2", "4", "5", "10") ~ "STEM", 
+        field_cd %in% c("1", "3", "8", "9", "11", "13") ~ "Social_Science",
+        field_cd %in% c("6", "7", "14", "15", "16", "17") ~ "Humanities",
+        TRUE ~ "Other"
+      ), 
+    race = recode(race, !!! recode_race), 
+    goal = recode(goal, !!! recode_goal),
+    met = if_else(met == "2", "0", met), 
+    met_o = if_else(met_o == "2", "0", met_o),
+    race_o = recode(race_o, !!! recode_race), 
+    gender = if_else(gender == "0", "female", "male"),
+    career_c = 
+      case_when(
+        career_c %in% c("3", "4", "5") ~ "STEM", 
+        career_c %in% c("1", "7", "8", "9", "10", "11", "12", "13", "17") ~ "Social_Science",
+        career_c %in% c("6") ~ "Humanities",
+        TRUE ~ "Other"
+      )
+  ) %>%
+  mutate_at(
+    vars(
+      career_c,
+      field_cd,
+      race,
+      race_o,
+      goal,
+      met,
+      met_o,
+      gender
+    ),
+    as.factor
+  )
+
+```
+
+### Adding in yes_rate, match_rate
+```{r}
+ ppl_all_in <-
+  test %>%
+  count(iid, dec) %>% 
+  count(iid) %>% 
+  filter(n == 1) %>% 
+  pull(iid)
+  
+all_in <-
+  test %>% 
+  filter(iid %in% ppl_all_in) %>% 
+  count(iid, dec) %>% 
+  group_by(iid) %>% 
+  mutate(
+    yes_rate = as.double(if_else(dec == 1, 1, 0))
+  ) %>% 
+  dplyr::select(iid, yes_rate)
+
+ yes_and_no <-
+   test %>%
+   filter(!(iid %in% ppl_all_in)) %>% 
+   count(iid, dec) %>% 
+   group_by(iid) %>% 
+   mutate(
+     reject_rate = n / sum(n), 
+     yes_rate = 1 - reject_rate
+   ) %>% 
+   filter(dec == 0) %>% 
+  dplyr::select(iid, yes_rate)
+ 
+yes_rate <-
+  yes_and_no %>% 
+  bind_rows(all_in)
+
+test  <-
+  test %>% 
+  left_join(
+    yes_rate, 
+    by = "iid"
+  )
+```
+
+## Normalize the preferences, if out of 100, to percentages instead. 
+
+```{r}
+
+test <-
+  test %>% 
+  rowwise() %>% 
+  mutate(
+    rating = sum(c(attr, sinc, intel, fun, amb, shar)), 
+    avg_partner_rating = 
+      mean(c(attr, sinc, intel, fun, amb, shar), na.rm = TRUE) / 10
+  ) %>%
+  mutate_at(
+    vars(attr, sinc, intel, fun, amb, shar), 
+    ~ . / rating
+  ) %>% 
+  select(-rating)
+
+```
+
+
+## Choosing Variables
+
+```{r}
+# Selecting only the variables that determine perception of the round of speed
+
+# Field and career are too unevenly entered, so best to use the coded versions instead. 
+
+vars_wanted <-
+  test %>% 
+  select(
+    rowname, 
+    gender, 
+    condtn, 
+    match:race_o,
+    like_o:age, 
+    field_cd, 
+    race:imprelig, 
+    goal:go_out, 
+    career_c:exphappy, 
+    dec:met, 
+    yes_rate,
+    avg_partner_rating
+  ) %>%
+  select(-c(met, met_o, go_out, date, career_c)) %>% 
+  summarize_all(~ sum(is.na(.))) %>% 
+  summarize_all(~ sum(.)) %>% 
+  mutate_all(~ . / 4258) %>% 
+  pivot_longer(
+    cols = everything(), 
+    names_to = "var", 
+    values_to = "percent_missing"
+  ) %>% 
+  filter(percent_missing < 0.5) 
+
+vars_wanted <-
+  vars_wanted %>% 
+  arrange(desc(percent_missing)) %>% 
+  filter(var != "income") %>% 
+  pull(var)
+
+all_testing_data <-
+  test %>% 
+  select(rowname, all_of(vars_wanted))
+
+```
+
+## Rescaling 1-10 scale to 0-1 scale
+
+```{r}
+
+all_testing_data <-
+  all_testing_data %>% 
+  mutate_at(vars(prob, prob_o, like, like_o, imprace, imprelig, sports:exphappy), 
+            ~ . / 10
+  )
+
+```
+
+
+
+```{r}
+
+lasso_model_data <- 
+  all_testing_data %>% 
+  select(-c(rowname, dec, match)) %>% 
+  mutate_at(vars(condtn), as.factor) %>%
+  select(-c(sports:yoga, condtn, field_cd)) %>% 
+  drop_na()
+
+# Factor all of the factors. No need to worry about collinearity because have formula already
+X <- model.matrix(
+  yes_rate ~ 0 + ., 
+  lasso_model_data, 
+  contrasts.arg =
+    list(
+      goal = contrasts(lasso_model_data$goal, contrasts = F), 
+      race = contrasts(lasso_model_data$race, contrasts = F), 
+      race_o = contrasts(lasso_model_data$race_o, contrasts = F), 
+      gender = contrasts(lasso_model_data$gender, contrasts = F)
+    )
+)
+
+test_model_data <-
+  X %>% 
+  as.data.frame() %>% 
+  bind_cols(lasso_model_data %>% select(yes_rate))
+```
+
+### Checking Homoscedasticity 
+```{r}
+
+res_vs_fitted <- function(model) {
+  residuals({{model}}) %>% 
+    unname() %>% 
+    as_tibble() %>% 
+    bind_cols(
+      fitted({{model}}) %>% unname()
+    ) %>% 
+    dplyr::rename(resid = 1, fitted = 2) %>% 
+    ggplot(aes(fitted, resid)) +
+    geom_point() +
+    geom_smooth()
+}
+  
+```
+
+### Calculating RMSE w/ CV
+
+```{r}
+
+
+cv_rmse_test <- function(model) {
+  cvFit(
+    {{model}}, 
+    data = test_model_data, 
+    y = test_model_data %>% pull(yes_rate), 
+    K = 10, 
+    seed = 1
+  )
+}
+
+```
+
+## Testing linear regression model
+
+
+### Creating the formula
+```{r}
+
+a <- "attr + intel + amb + shar + prob + prob_o + int_corr + like + like_o + avg_partner_rating + imprace + goalLooking_for_a_serious_relationship + goalOther + `goalTo say I did it` + goalTo_get_a_date + exphappy + raceBlack + raceHispanic + raceOther + raceWhite + race_oBlack + race_oWhite + gendermale + attr:intel + attr:amb + attr:shar + attr:prob + attr:prob_o + attr:int_corr + attr:like + attr:like_o + attr:avg_partner_rating + attr:imprace + attr:goalLooking_for_a_serious_relationship + attr:goalOther + attr:`goalTo say I did it` + attr:goalTo_get_a_date"
+
+b <- "+ attr:exphappy + attr:raceBlack + attr:raceHispanic + attr:raceOther + attr:raceWhite + attr:race_oBlack + attr:race_oWhite + attr:gendermale + intel:amb + intel:shar + intel:prob + intel:prob_o + intel:int_corr + intel:like + intel:like_o + intel:avg_partner_rating + intel:imprace + intel:goalLooking_for_a_serious_relationship + intel:goalOther + intel:`goalTo say I did it`+intel:goalTo_get_a_date + intel:exphappy + intel:raceBlack + intel:raceHispanic + intel:raceOther + intel:raceWhite + intel:race_oBlack + intel:race_oWhite + intel:gendermale + amb:shar + amb:prob + amb:prob_o + amb:int_corr + amb:like + amb:like_o + amb:avg_partner_rating + amb:imprace + amb:goalLooking_for_a_serious_relationship + amb:goalOther + amb:`goalTo say I did it` + amb:goalTo_get_a_date + amb:exphappy + amb:raceBlack + amb:raceHispanic + amb:raceOther + amb:raceWhite + amb:race_oBlack + amb:race_oWhite + amb:gendermale + shar:prob + shar:prob_o + shar:int_corr"
+
+c <- "+ shar:like + shar:like_o + shar:avg_partner_rating + shar:imprace + shar:goalLooking_for_a_serious_relationship + shar:goalOther + shar:`goalTo say I did it` + shar:goalTo_get_a_date + shar:exphappy + shar:raceBlack + shar:raceHispanic + shar:raceOther + shar:raceWhite + shar:race_oBlack + shar:race_oWhite + shar:gendermale + prob:prob_o + prob:int_corr + prob:like + prob:like_o + prob:avg_partner_rating + prob:imprace + prob:goalLooking_for_a_serious_relationship + prob:goalOther + prob:`goalTo say I did it` + prob:goalTo_get_a_date + prob:exphappy + prob:raceBlack + prob:raceHispanic + prob:raceOther + prob:raceWhite + prob:race_oBlack + prob:race_oWhite + prob:gendermale + prob_o:int_corr + prob_o:like + prob_o:like_o + prob_o:avg_partner_rating + prob_o:imprace + prob_o:goalLooking_for_a_serious_relationship + prob_o:goalOther + prob_o:`goalTo say I did it` + prob_o:goalTo_get_a_date + prob_o:exphappy + prob_o:raceBlack + prob_o:raceHispanic"
+
+d <- "+ prob_o:raceOther + prob_o:raceWhite + prob_o:race_oBlack + prob_o:race_oWhite + prob_o:gendermale + int_corr:like + int_corr:like_o + int_corr:avg_partner_rating + int_corr:imprace + int_corr:goalLooking_for_a_serious_relationship + int_corr:goalOther + int_corr:`goalTo say I did it` + int_corr:goalTo_get_a_date + int_corr:exphappy + int_corr:raceBlack + int_corr:raceHispanic + int_corr:raceOther + int_corr:raceWhite + int_corr:race_oBlack + int_corr:race_oWhite + int_corr:gendermale + like:like_o + like:avg_partner_rating + like:imprace + like:goalLooking_for_a_serious_relationship + like:goalOther + like:`goalTo say I did it` + like:goalTo_get_a_date + like:exphappy + like:raceBlack + like:raceHispanic + like:raceOther + like:raceWhite + like:race_oBlack + like:race_oWhite + like:gendermale + like_o:avg_partner_rating + like_o:imprace + like_o:goalLooking_for_a_serious_relationship + like_o:goalOther + like_o:`goalTo say I did it` + like_o:goalTo_get_a_date + like_o:exphappy + like_o:raceBlack + like_o:raceHispanic + like_o:raceOther + like_o:raceWhite + like_o:race_oBlack + like_o:race_oWhite + like_o:gendermale + avg_partner_rating:imprace + avg_partner_rating:goalLooking_for_a_serious_relationship + avg_partner_rating:goalOther + avg_partner_rating:`goalTo say I did it` + avg_partner_rating:goalTo_get_a_date + avg_partner_rating:exphappy + avg_partner_rating:raceBlack + avg_partner_rating:raceHispanic + avg_partner_rating:raceOther + avg_partner_rating:raceWhite + avg_partner_rating:race_oBlack + avg_partner_rating:race_oWhite + avg_partner_rating:gendermale + imprace:goalLooking_for_a_serious_relationship + imprace:goalOther + imprace:`goalTo say I did it` + imprace:goalTo_get_a_date + imprace:exphappy + imprace:raceBlack + imprace:raceHispanic + imprace:raceOther + imprace:raceWhite + imprace:race_oBlack + imprace:race_oWhite + imprace:gendermale + goalLooking_for_a_serious_relationship:exphappy + goalLooking_for_a_serious_relationship:raceBlack + goalLooking_for_a_serious_relationship:raceOther + goalLooking_for_a_serious_relationship:raceWhite + goalLooking_for_a_serious_relationship:race_oBlack + goalLooking_for_a_serious_relationship:race_oWhite + goalLooking_for_a_serious_relationship:gendermale + goalOther:exphappy + goalOther:raceBlack + goalOther:raceHispanic + goalOther:raceOther + goalOther:raceWhite + goalOther:race_oBlack + goalOther:race_oWhite + goalOther:gendermale + `goalTo say I did it`:exphappy + `goalTo say I did it`:raceBlack + `goalTo say I did it`:raceHispanic + `goalTo say I did it`:raceWhite + `goalTo say I did it`:race_oBlack + `goalTo say I did it`:race_oWhite + `goalTo say I did it`:gendermale + goalTo_get_a_date:exphappy + goalTo_get_a_date:raceHispanic + goalTo_get_a_date:raceOther + goalTo_get_a_date:raceWhite + goalTo_get_a_date:race_oBlack + goalTo_get_a_date:race_oWhite + goalTo_get_a_date:gendermale + exphappy:raceBlack + exphappy:raceHispanic + exphappy:raceOther + exphappy:raceWhite + exphappy:race_oBlack + exphappy:race_oWhite + exphappy:gendermale + raceBlack:race_oBlack + raceBlack:race_oWhite + raceBlack:gendermale + raceHispanic:race_oBlack + raceHispanic:race_oWhite + raceHispanic:gendermale + raceOther:race_oBlack + raceOther:race_oWhite + raceOther:gendermale + raceWhite:race_oBlack + raceWhite:race_oWhite + raceWhite:gendermale + race_oBlack:gendermale + race_oWhite:gendermale"
+
+
+f <-
+  str_c("yes_rate ~", a, b, c, d)
+
+```
+
+
+### Creating model
+
+```{r}
+
+test_model <-
+  lm(
+    formula = f, 
+    data = test_model_data
+  )
+
+
+```
+
+
+```{r}
+res_vs_fitted(test_model)
+```
+
+### Rsquared and RMSE
+
+```{r}
+
+summary(test_model)$r.squared
+
+# How to solve rank deficient fit?
+cv_rmse_test(test_model)
+
+```
+

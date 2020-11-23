@@ -1,0 +1,637 @@
+---
+title: "Creating Model for Training Data"
+author: Angela Zhao
+date: "`r Sys.Date()`"
+output: 
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE,dpi=500}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+# Libraries
+library(tidyverse)
+library(here)
+library(cvTools)
+library(coefplot)
+library(glmnet)
+library(GGally)
+library(ROCR)
+
+file_raw_train_data <-
+  here("data/train_data_speed_dating.csv")
+
+recode_race <-
+  c(
+    "1" = "Black", 
+    "2" = "White", 
+    "3" = "Hispanic", 
+    "4" = "API", 
+    "5" = "Indigenous",
+    "6" = "Other"
+  )
+  
+
+recode_goal <-
+  c(
+    "1" = 'Seemed like a fun night out',   
+    "2" = "To meet new people",
+    "3" = "To get a date", 
+    "4" = "Looking for a serious relationship",
+    "5" = "To say I did it",
+    "6" = "Other"
+  )
+
+
+recode_date <- c(
+  "1" = 'Several times a week',   
+  "2" = "Twice a week",
+  "3" = "Once a week", 
+  "4" = "Twice a month",
+  "5" = "Once a month",
+  "6" = "Several times a year",
+  "7" = "Almost never"
+)
+
+
+recode_go_out <-
+  c(
+    "1" = 'Several times a week',   
+    "2" = "Twice a week",
+    "3" = "Once a week", 
+    "4" = "Twice a month",
+    "5" = "Once a month",
+    "6" = "Several times a year",
+    "7" = "Almost never"
+    
+  )
+
+```
+
+## Reading and cleaning Data
+
+
+```{r}
+train <-
+  file_raw_train_data %>% 
+  read_csv()
+
+
+# Added in the ratings of partner rating you and you rating the partner
+# diff is the avg of partner rating you - avg of you rating the partner
+
+train <-
+  train %>% 
+  mutate_at(
+    vars(
+      career_c, 
+      field_cd,
+      race,
+      race_o,
+      zipcode,
+      go_out,
+      date,
+      goal,
+      met,
+      met_o,
+      samerace,
+      gender,
+      match
+    ), 
+    as.character
+  ) %>% 
+  mutate(
+    field_cd = 
+      case_when(
+        field_cd %in% c("2", "4", "5", "10") ~ "STEM", 
+        field_cd %in% c("1", "3", "8", "9", "11", "13") ~ "Social_Science",
+        field_cd %in% c("6", "7", "14", "15", "16", "17") ~ "Humanities",
+        TRUE ~ "Other"
+      ), 
+    race = recode(race, !!! recode_race), 
+    goal = recode(goal, !!! recode_goal),
+    met = if_else(met == "2", "0", met), 
+    met_o = if_else(met_o == "2", "0", met_o),
+    race_o = recode(race_o, !!! recode_race), 
+    gender = if_else(gender == "0", "female", "male"),
+    career_c = 
+      case_when(
+        career_c %in% c("3", "4", "5") ~ "STEM", 
+        career_c %in% c("1", "7", "8", "9", "10", "11", "12", "13", "17") ~ "Social_Science",
+        career_c %in% c("6") ~ "Humanities",
+        TRUE ~ "Other"
+      )
+  ) %>%
+  mutate_at(
+    vars(
+      career_c,
+      field_cd,
+      race,
+      race_o,
+      goal,
+      met,
+      met_o,
+      gender
+    ),
+    as.factor
+  )
+```
+
+## Normalize the preferences, if out of 100, to percentages instead. 
+
+```{r}
+
+train <-
+  train %>% 
+  rowwise() %>% 
+  mutate(
+    sum_2_1 = sum(c(attr2_1, sinc2_1, intel2_1, fun2_1, amb2_1, shar2_1)), 
+    sum_4_1 = sum(c(attr4_1, sinc4_1, intel4_1, fun4_1, amb4_1, shar4_1)),
+  ) %>%
+  mutate_at(
+    vars(attr2_1, sinc2_1, intel2_1, fun2_1, amb2_1, shar2_1), 
+    ~ . / sum_2_1
+  ) %>%
+  mutate_at(
+    vars(attr4_1, sinc4_1, intel4_1, fun4_1, amb4_1, shar4_1), 
+    ~ . / sum_4_1
+  ) %>%
+  dplyr::select(-c(sum_2_1, sum_4_1))
+
+train <-
+  train %>% 
+  rowwise() %>% 
+  mutate(
+    rating = sum(c(attr, sinc, intel, fun, amb, shar)), 
+    avg_partner_rating = 
+      mean(c(attr, sinc, intel, fun, amb, shar), na.rm = TRUE) / 10
+  ) %>%
+  mutate_at(
+    vars(attr, sinc, intel, fun, amb, shar), 
+    ~ . / rating
+  ) %>% 
+  select(-rating)
+
+```
+
+
+## Choosing Variables
+
+```{r}
+# Selecting only the variables that determine perception of the round of speed
+
+# Field and career are too unevenly entered, so best to use the coded versions instead. 
+
+vars_wanted <-
+  train %>% 
+  select(
+    rowname, 
+    gender, 
+    condtn, 
+    match:race_o,
+    like_o:age, 
+    field_cd, 
+    race:imprelig, 
+    goal:go_out, 
+    career_c:exphappy, 
+    dec:met, 
+    avg_partner_rating
+  ) %>%
+  select(-c(met, met_o, dec)) %>% 
+  summarize_all(~ sum(is.na(.))) %>% 
+  summarize_all(~ sum(.)) %>% 
+  mutate_all(~ . / 4258) %>% 
+  pivot_longer(
+    cols = everything(), 
+    names_to = "var", 
+    values_to = "percent_missing"
+  ) %>% 
+  filter(percent_missing < 0.5) 
+
+vars_wanted <-
+  vars_wanted %>% 
+  arrange(desc(percent_missing)) %>% 
+  filter(var != "income") %>% 
+  pull(var)
+
+all_training_data <-
+  train %>% 
+  select(rowname, all_of(vars_wanted))
+
+
+```
+
+## Rescaling 1-10 scale to 0-1 scale
+
+```{r}
+
+all_training_data <-
+  all_training_data %>% 
+  mutate_at(
+    vars(prob, prob_o, like, like_o, imprace, imprelig, sports:exphappy), 
+    ~ . / 10
+  ) %>% 
+  mutate(
+    match = as.double(match)
+  ) 
+
+
+cor_data <-
+  all_training_data %>% 
+  drop_na()
+
+```
+## Checking for correlations
+
+```{r, fig.height=20, fig.width=20}
+
+# Convert data to numeric
+corr <- 
+  cor_data %>% 
+  mutate_all(as.integer)
+
+# ggcorr(corr,
+#     method = c("pairwise", "spearman"),
+#     nbreaks = 6,
+#     hjust = 0.8,
+#     label = TRUE,
+#     label_size = 3,
+#     color = "grey50")
+```
+
+
+
+## Create a train and a validate set
+
+```{r}
+
+random_rows <-
+  all_training_data %>%
+  pull(rowname) %>% 
+  as_tibble %>% 
+  sample_frac(0.8) %>% 
+  mutate(
+    value = as.character(value)
+  ) %>% 
+  pull(value)
+
+train_model_data <-
+  all_training_data %>%
+  as_tibble() %>% 
+  filter(rowname %in% random_rows)
+
+test_model_data <-
+  all_training_data %>%
+  anti_join(train_model_data, by = "rowname") %>% 
+  select(-rowname) 
+
+
+lasso_model_data <- 
+  train_model_data %>% 
+  select(-rowname) %>% 
+  mutate_at(vars(condtn), as.factor) %>%
+  drop_na()
+```
+
+## Using lasso to weed out extraneous vars 
+
+```{r}
+
+# convert the data to a design matrix
+X = model.matrix(match ~ 0 + ., lasso_model_data)
+Y = lasso_model_data %>% pull(match)
+
+
+# standardize
+X = scale(X)
+Y = scale(Y)
+
+set.seed(1244)
+
+# create training and test set
+train.ind = sample(nrow(X), round(nrow(X)/2))
+X.train = X[train.ind,]
+X.test = X[-train.ind,]
+Y.train = Y[train.ind]
+Y.test = Y[-train.ind]
+
+# set lambda sequence to use for lasso and ridge
+lambdas = 10^seq(-2,1.5,0.1)
+
+#lasso
+fm.lasso = glmnet(X.train, Y.train, alpha = 1, lambda = lambdas, thresh = 1e-12)
+
+fm.lasso %>%
+  summary()
+
+cv <- cv.glmnet(X.train, Y.train)
+
+cv$lambda.min
+
+covars_wanted <-
+  extract.coef(cv) %>%
+  select(coeff = Coefficient) %>%
+  filter(coeff != "(Intercept)") %>%
+  pull(coeff)
+
+
+covars_wanted <-
+  covars_wanted %>%
+  as_tibble() %>%
+  filter(value %in% colnames(train)) %>%
+  pull(value)
+
+covars_wanted
+
+# train_model_data <-
+#   train_model_data %>% 
+#   select(match, all_of(covars_wanted))
+
+```
+
+## Data used
+
+```{r}
+# Add in field_cd and career_c b/c rep as factors in covars_wanted
+train_model_data <-
+  train_model_data %>%
+  select(match, attr, sinc, fun, prob, prob_o, like, like_o, avg_partner_rating, imprace, tvsports, clubbing, movies, shopping, age_o)
+
+
+```
+
+## Functions
+
+### Accuracy
+
+```{r}
+
+accuracy <- function(table_mat) {
+  sum(diag(table_mat)) / sum(table_mat)
+}
+
+
+```
+
+### Precision and 
+```{r}
+precision <- function(matrix) {
+
+    tp <- matrix[2, 2]
+	
+    fp <- matrix[1, 2]
+    return(tp / (tp + fp))
+}
+
+recall <- function(matrix) {
+    tp <- matrix[2, 2]
+    fn <- matrix[2, 1]
+    return(tp / (tp + fn))
+}
+
+```
+
+## Linear Regression
+
+### With all lasso covariates
+
+```{r}
+m1 <-
+  glm(
+    match ~ ., 
+    data = train_model_data, 
+    family = 'binomial'
+  ) 
+
+
+
+predict <- predict(m1, test_model_data, type = 'response')
+# confusion matrix
+table_mat <- table(test_model_data$match, predict > 0.5)
+table_mat
+
+accuracy(table_mat)
+precision(table_mat)
+
+recall(table_mat)
+
+```
+
+# ROC curve
+```{r}
+index <-
+  predict[!is.na(predict)] %>% 
+  as.data.frame() %>% 
+  add_rownames() %>% 
+  pull(rowname)
+
+
+t <-
+  test_model_data %>% 
+  add_rownames() %>% 
+  filter(rowname %in% index)
+
+
+ROCRpred <- prediction(predict[!is.na(predict)], t$match)
+ROCRperf <- performance(ROCRpred, 'tpr', 'fpr')
+plot(ROCRperf, colorize = TRUE, text.adj = c(-0.2, 1.7))
+
+
+```
+
+## Creating a model with interaction terms
+
+```{r}
+
+m2 <-
+  glm(
+    match ~ . + like:avg_partner_rating + attr:like_o, 
+    data = train_model_data, 
+    family = 'binomial'
+  ) 
+
+m2 %>% 
+  summary()
+
+
+
+predict <- predict(m2, test_model_data, type = 'response')
+# confusion matrix
+table_mat <- table(test_model_data$match, predict > 0.5)
+table_mat
+
+
+accuracy(table_mat)
+precision(table_mat)
+
+recall(table_mat)
+
+
+```
+
+```{r}
+index <-
+  predict[!is.na(predict)] %>% 
+  as.data.frame() %>% 
+  add_rownames() %>% 
+  pull(rowname)
+
+
+t <-
+  test_model_data %>% 
+  add_rownames() %>% 
+  filter(rowname %in% index)
+
+
+ROCRpred <- prediction(predict[!is.na(predict)], t$match)
+ROCRperf <- performance(ROCRpred, 'tpr', 'fpr')
+plot(ROCRperf, colorize = TRUE, text.adj = c(-0.2, 1.7))
+
+
+```
+
+
+
+```{r}
+
+m3 <-
+  glm(
+    best_formula, 
+    train_model_data, 
+    family = 'binomial'
+  ) 
+
+summary(m3)
+
+```
+
+```{r}
+
+m3 <-
+  glm(
+    match ~ . + .:., 
+    data = train_model_data, 
+    family = 'binomial'
+  ) 
+
+summary(m3)
+
+
+predict <- predict(m3, test_model_data, type = 'response')
+# confusion matrix
+table_mat <- table(test_model_data$match, predict > 0.5)
+table_mat
+
+accuracy(table_mat)
+precision(table_mat)
+
+recall(table_mat)
+
+x <- 
+  summary(m3)
+
+z <-
+  x$coefficients %>% 
+  as.data.frame() %>% 
+  add_rownames() %>% 
+  slice(-1) %>% 
+  pull(rowname)
+
+formula_wanted <-
+  str_c("match ~ ", str_c(z, collapse = " + "))
+
+```
+
+```{r}
+index <-
+  predict[!is.na(predict)] %>% 
+  as.data.frame() %>% 
+  add_rownames() %>% 
+  pull(rowname)
+
+
+t <-
+  test_model_data %>% 
+  add_rownames() %>% 
+  filter(rowname %in% index)
+
+
+ROCRpred <- prediction(predict[!is.na(predict)], t$match)
+ROCRperf <- performance(ROCRpred, 'tpr', 'fpr')
+plot(ROCRperf, colorize = TRUE, text.adj = c(-0.2, 1.7))
+
+
+```
+
+## Stepwise AIC regression on model 2
+
+```{r}
+
+
+train_model_data <-
+  train_model_data %>% 
+  drop_na()
+
+
+
+full_model = glm(match ~ . + .:., family = binomial(), data = train_model_data)
+
+#summary(full_model)
+
+
+null_model = glm(match ~ 1, family = binomial(), data = train_model_data)
+
+#summary(null_model)
+
+steps <-
+  step(null_model, list(upper = full_model), direction = 'forward')
+
+
+```
+
+
+```{r}
+best_model <-
+  glm(formula = match ~ like + like_o + prob + attr + imprace + 
+    prob_o + fun + tvsports + avg_partner_rating + clubbing +
+    movies + like:prob + like_o:attr + like:avg_partner_rating +
+    like:like_o + like_o:prob_o + attr:tvsports + fun:clubbing +
+    attr:clubbing + imprace:movies + like:movies + clubbing:movies +
+    attr:prob_o + tvsports:clubbing + prob:tvsports + tvsports:avg_partner_rating +
+    like:clubbing, family = binomial(), data = train_model_data)
+
+predict <- predict(m2, test_model_data, type = 'response')
+# confusion matrix
+table_mat <- table(test_model_data$match, predict > 0.5)
+table_mat
+
+accuracy(table_mat)
+precision(table_mat)
+recall(table_mat)
+
+
+index <-
+  predict[!is.na(predict)] %>% 
+  as.data.frame() %>% 
+  add_rownames() %>% 
+  pull(rowname)
+
+summary(best_model)
+
+
+t <-
+  test_model_data %>% 
+  add_rownames() %>% 
+  filter(rowname %in% index)
+
+
+ROCRpred <- prediction(predict[!is.na(predict)], t$match)
+ROCRperf <- performance(ROCRpred, 'tpr', 'fpr')
+plot(ROCRperf, colorize = TRUE, text.adj = c(-0.2, 1.7))
+
+```
+
+

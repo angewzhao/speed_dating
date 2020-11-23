@@ -1,0 +1,475 @@
+---
+title: "Inference on Classification Model"
+author: Angela Zhao
+date: "`r Sys.Date()`"
+output: 
+  pdf_document:
+    toc: true
+---
+
+```{r setup, include=FALSE,dpi=500}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+# Libraries
+library(tidyverse)
+library(here)
+library(cvTools)
+library(coefplot)
+library(glmnet)
+library(GGally)
+library(ROCR)
+
+file_raw_train_data <-
+  here("data/train_data_speed_dating.csv")
+
+recode_race <-
+  c(
+    "1" = "Black", 
+    "2" = "White", 
+    "3" = "Hispanic", 
+    "4" = "API", 
+    "5" = "Indigenous",
+    "6" = "Other"
+  )
+  
+
+recode_goal <-
+  c(
+    "1" = 'Seemed like a fun night out',   
+    "2" = "To meet new people",
+    "3" = "To get a date", 
+    "4" = "Looking for a serious relationship",
+    "5" = "To say I did it",
+    "6" = "Other"
+  )
+
+
+recode_date <- c(
+  "1" = 'Several times a week',   
+  "2" = "Twice a week",
+  "3" = "Once a week", 
+  "4" = "Twice a month",
+  "5" = "Once a month",
+  "6" = "Several times a year",
+  "7" = "Almost never"
+)
+
+
+recode_go_out <-
+  c(
+    "1" = 'Several times a week',   
+    "2" = "Twice a week",
+    "3" = "Once a week", 
+    "4" = "Twice a month",
+    "5" = "Once a month",
+    "6" = "Several times a year",
+    "7" = "Almost never"
+    
+  )
+
+```
+
+## Reading and cleaning Data
+
+
+```{r}
+train <-
+  file_raw_train_data %>% 
+  read_csv()
+
+
+# Added in the ratings of partner rating you and you rating the partner
+# diff is the avg of partner rating you - avg of you rating the partner
+
+train <-
+  train %>% 
+  mutate_at(
+    vars(
+      career_c, 
+      field_cd,
+      race,
+      race_o,
+      zipcode,
+      go_out,
+      date,
+      goal,
+      met,
+      met_o,
+      samerace,
+      gender,
+      match
+    ), 
+    as.character
+  ) %>% 
+  mutate(
+    field_cd = 
+      case_when(
+        field_cd %in% c("2", "4", "5", "10") ~ "STEM", 
+        field_cd %in% c("1", "3", "8", "9", "11", "13") ~ "Social_Science",
+        field_cd %in% c("6", "7", "14", "15", "16", "17") ~ "Humanities",
+        TRUE ~ "Other"
+      ), 
+    race = recode(race, !!! recode_race), 
+    goal = recode(goal, !!! recode_goal),
+    met = if_else(met == "2", "0", met), 
+    met_o = if_else(met_o == "2", "0", met_o),
+    race_o = recode(race_o, !!! recode_race), 
+    gender = if_else(gender == "0", "female", "male"),
+    career_c = 
+      case_when(
+        career_c %in% c("3", "4", "5") ~ "STEM", 
+        career_c %in% c("1", "7", "8", "9", "10", "11", "12", "13", "17") ~ "Social_Science",
+        career_c %in% c("6") ~ "Humanities",
+        TRUE ~ "Other"
+      )
+  ) %>%
+  mutate_at(
+    vars(
+      career_c,
+      field_cd,
+      race,
+      race_o,
+      goal,
+      met,
+      met_o,
+      gender
+    ),
+    as.factor
+  )
+```
+
+## Normalize the preferences, if out of 100, to percentages instead. 
+
+```{r}
+
+train <-
+  train %>% 
+  rowwise() %>% 
+  mutate(
+    sum_2_1 = sum(c(attr2_1, sinc2_1, intel2_1, fun2_1, amb2_1, shar2_1)), 
+    sum_4_1 = sum(c(attr4_1, sinc4_1, intel4_1, fun4_1, amb4_1, shar4_1)),
+  ) %>%
+  mutate_at(
+    vars(attr2_1, sinc2_1, intel2_1, fun2_1, amb2_1, shar2_1), 
+    ~ . / sum_2_1
+  ) %>%
+  mutate_at(
+    vars(attr4_1, sinc4_1, intel4_1, fun4_1, amb4_1, shar4_1), 
+    ~ . / sum_4_1
+  ) %>%
+  dplyr::select(-c(sum_2_1, sum_4_1))
+
+train <-
+  train %>% 
+  rowwise() %>% 
+  mutate(
+    rating = sum(c(attr, sinc, intel, fun, amb, shar)), 
+    avg_partner_rating = 
+      mean(c(attr, sinc, intel, fun, amb, shar), na.rm = TRUE) / 10
+  ) %>%
+  mutate_at(
+    vars(attr, sinc, intel, fun, amb, shar), 
+    ~ . / rating
+  ) %>% 
+  select(-rating)
+
+```
+
+
+## Choosing Variables
+
+```{r}
+# Selecting only the variables that determine perception of the round of speed
+
+# Field and career are too unevenly entered, so best to use the coded versions instead. 
+
+vars_wanted <-
+  train %>% 
+  select(
+    rowname, 
+    gender, 
+    condtn, 
+    match:race_o,
+    like_o:age, 
+    field_cd, 
+    race:imprelig, 
+    goal:go_out, 
+    career_c:exphappy, 
+    dec:met, 
+    avg_partner_rating
+  ) %>%
+  select(-c(met, met_o, dec)) %>% 
+  summarize_all(~ sum(is.na(.))) %>% 
+  summarize_all(~ sum(.)) %>% 
+  mutate_all(~ . / 4258) %>% 
+  pivot_longer(
+    cols = everything(), 
+    names_to = "var", 
+    values_to = "percent_missing"
+  ) %>% 
+  filter(percent_missing < 0.5) 
+
+vars_wanted <-
+  vars_wanted %>% 
+  arrange(desc(percent_missing)) %>% 
+  filter(var != "income") %>% 
+  pull(var)
+
+all_training_data <-
+  train %>% 
+  select(rowname, all_of(vars_wanted))
+
+
+```
+
+## Rescaling 1-10 scale to 0-1 scale
+
+```{r}
+
+all_training_data <-
+  all_training_data %>% 
+  mutate_at(
+    vars(prob, prob_o, like, like_o, imprace, imprelig, sports:exphappy), 
+    ~ . / 10
+  ) %>% 
+  mutate(
+    match = as.double(match)
+  ) 
+
+```
+
+## Create a test and a validate set
+
+```{r}
+
+lasso_model_data <- 
+  all_training_data %>% 
+  select(-rowname) %>% 
+  mutate_at(vars(condtn), as.factor) %>%
+  drop_na()
+
+X <- model.matrix(
+  match ~ 0 + ., 
+  lasso_model_data, 
+  contrasts.arg =
+    list(
+      goal = contrasts(lasso_model_data$goal, contrasts = F), 
+      race = contrasts(lasso_model_data$race, contrasts = F), 
+      race_o = contrasts(lasso_model_data$race_o, contrasts = F), 
+      gender = contrasts(lasso_model_data$gender, contrasts = F)
+    )
+)
+
+train_model_data <-
+  X %>% 
+  as.data.frame() %>% 
+  bind_cols(lasso_model_data %>% select(match))
+
+```
+
+## Logistic Regression
+
+```{r}
+
+best_formula <-
+  "match ~ attr + sinc + fun + prob + prob_o + like + like_o + avg_partner_rating + imprace + tvsports + clubbing + movies + shopping + age_o + attr:sinc + attr:fun + attr:prob + attr:prob_o + attr:like + attr:like_o + attr:avg_partner_rating + attr:imprace + attr:tvsports + attr:clubbing + attr:movies + attr:shopping + attr:age_o + sinc:fun + sinc:prob + sinc:prob_o + sinc:like + sinc:like_o + sinc:avg_partner_rating + sinc:imprace + sinc:tvsports + sinc:clubbing + sinc:movies + sinc:shopping + sinc:age_o + fun:prob + fun:prob_o + fun:like + fun:like_o + fun:avg_partner_rating + fun:imprace + fun:tvsports + fun:clubbing + fun:movies + fun:shopping + fun:age_o + prob:prob_o + prob:like + prob:like_o + prob:avg_partner_rating + prob:imprace + prob:tvsports + prob:clubbing + prob:movies + prob:shopping + prob:age_o + prob_o:like + prob_o:like_o + prob_o:avg_partner_rating + prob_o:imprace + prob_o:tvsports + prob_o:clubbing + prob_o:movies + prob_o:shopping + prob_o:age_o + like:like_o + like:avg_partner_rating + like:imprace + like:tvsports + like:clubbing + like:movies + like:shopping + like:age_o + like_o:avg_partner_rating + like_o:imprace + like_o:tvsports + like_o:clubbing + like_o:movies + like_o:shopping + like_o:age_o + avg_partner_rating:imprace + avg_partner_rating:tvsports + avg_partner_rating:clubbing + avg_partner_rating:movies + avg_partner_rating:shopping + avg_partner_rating:age_o + imprace:tvsports + imprace:clubbing + imprace:movies + imprace:shopping + imprace:age_o + tvsports:clubbing + tvsports:movies + tvsports:shopping + tvsports:age_o + clubbing:movies + clubbing:shopping + clubbing:age_o + movies:shopping + movies:age_o + shopping:age_o"
+
+ train_model <-
+   glm(
+    best_formula, 
+    data = train_model_data, 
+    family = 'binomial'
+  ) 
+
+
+```
+
+## Inference
+
+```{r}
+
+summary(train_model)
+
+predict <- predict(train_model, train_model_data, type = 'response')
+
+table_mat <- table(train_model_data$match, predict > 0.5)
+table_mat
+
+accuracy(table_mat)
+precision(table_mat)
+
+recall(table_mat)
+
+
+```
+
+## Bootstrapping
+
+```{r}
+
+n <- nrow(train_model_data)
+
+rep <- 1000
+
+coef_data <-
+  train_model$coefficients %>% 
+  as.list() %>% 
+  as_tibble %>% 
+  select(-"(Intercept)") %>% 
+  pivot_longer(
+    cols = everything(), 
+    names_to = "coef", 
+    values_to = "val"
+  ) %>% 
+  select(-val)
+
+  
+
+for (i in 1:rep) {
+  data <-
+    train_model_data %>% 
+    slice_sample(n = n, replace = TRUE)
+  
+  model <-
+    glm(
+      best_formula, 
+      data = data, 
+      family = 'binomial'
+    ) 
+  
+  model_coef <-
+    model$coefficients %>% 
+    as.list() %>% 
+    as_tibble %>% 
+    select(-"(Intercept)") %>% 
+    pivot_longer(
+      cols = everything(), 
+      names_to = "coef", 
+      values_to = str_c("val_", as.character(i))
+    )
+  
+  coef_data <-
+    coef_data %>% 
+    left_join(
+      model_coef, 
+      by = "coef"
+    )
+  
+}
+
+```
+
+### Calculating confidence intervals
+
+```{r}
+
+coef_se <-
+  as_tibble(cbind(nms = names(coef_data), t(coef_data))) %>% 
+  janitor::row_to_names(row_number = 1) %>% 
+  rename(
+    rep = coef
+  ) %>% 
+  select(-rep) %>% 
+  summarise(across(everything(), sd)) %>%
+  pivot_longer(
+    cols = everything(), 
+    names_to = "coef", 
+    values_to = "se"
+  )
+
+coef_ci <-
+  coef_data %>% 
+  mutate(
+    mean = rowMeans(select(., starts_with("val")), na.rm = TRUE)
+  ) %>% 
+  select(coef, mean) %>% 
+  left_join(
+    coef_se, 
+    by = "coef"
+  )
+
+coef_ci
+
+
+```
+
+## Looking at distribution of coefficients
+
+All are relatively normal, so we can use SE to estimate the confidence intervals 
+```{r}
+
+coef_distr <-
+  as_tibble(cbind(nms = names(coef_data), t(coef_data))) %>% 
+  janitor::row_to_names(row_number = 1) %>% 
+  rename(
+    rep = coef
+  ) %>%
+  mutate_at(vars(-rep), as.double) %>% 
+  select(-rep) %>% 
+  rename_all(~ str_remove_all(., ":"))
+
+hist_func <- function(var) {
+  coef_distr %>% 
+  ggplot(aes_string({{var}})) +
+  geom_histogram()
+}
+
+
+vars <-
+  coef_distr %>% 
+  colnames() 
+
+vars %>% 
+  map(~ hist_func(.))
+
+```
+
+## Estimating confidence intervals
+
+```{r}
+coef_ci %>%
+  mutate(
+    lower_95 = mean - 1.96*se, 
+    upper_95 = mean + 1.96 * se, 
+    sig = 
+      if_else(
+        lower_95 > 0 | upper_95 < 0, 
+        TRUE, 
+        FALSE
+      )
+  ) %>% 
+  filter(sig)
+
+
+training_r_sig <-
+  c("imprace", "fun:avg_partner_rating", "fun:clubbing", "fun:movies", "tvsports:shopping")
+
+coef_ci %>% 
+  as_tibble() %>% 
+  mutate(
+    lower_95 = mean - 1.96*se, 
+    upper_95 = mean + 1.96 * se, 
+    sig = 
+      if_else(
+        lower_95 > 0 | upper_95 < 0, 
+        TRUE, 
+        FALSE
+      )
+  ) %>%
+  filter(coef %in% training_r_sig)
+
+```
+```{r}
+all <-
+   glm(
+    match ~ . + .:., 
+    data = train_model_data, 
+    family = 'binomial'
+  ) 
+
+
+summary(all)
+```
+

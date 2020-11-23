@@ -1,0 +1,134 @@
+---
+title: "Prepping Dataset"
+author: Angela Zhao
+date: "`r Sys.Date()`"
+output: 
+  github_document:
+    toc: true
+---
+
+```{r setup, include=FALSE,dpi=500}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, warning=FALSE}
+# Libraries
+library(tidyverse)
+library(here)
+library(cvTools)
+library(glmnet)
+
+
+file_raw <-
+  here("data-raw/speed_dating.csv")
+
+file_out_speed_dating <-
+  here("data/speed_dating.csv")
+
+file_out_test_data <-
+  here("data/test_data_speed_dating.csv")
+
+file_out_train_data <-
+  here("data/train_data_speed_dating.csv")
+
+```
+
+
+## Portioning off the test and training data: DO NOT RUN AGAIN
+```{r}
+
+# Remove all waves that had variations in the data set. 
+
+# data_all <-
+#   file_raw %>%
+#   read_csv() %>%
+#   tibble::rownames_to_column() %>%
+#    mutate(
+#     wave = as.character(wave)
+#   ) %>%
+#   filter(!wave %in% c(5, 12, 13, 14, 18, 19, 20, 21)) %>%
+#   mutate(
+#     wave = as.double(wave)
+#   )
+# 
+# data_all %>%
+#   write_csv(file_out_speed_dating)
+# 
+# test <-
+#   data_all %>%
+#   slice_sample(prop = 0.2)
+# 
+# test %>%
+#   write_csv(file_out_test_data)
+# 
+# train <-
+#   data_all %>%
+#   anti_join(test, by = "rowname")
+# 
+# 
+# train %>%
+#   write_csv(file_out_train_data)
+
+#hitters.df
+```
+
+```{r}
+# Analysis of hitters' salary data using ridge and lasso
+
+library(ISLR)
+library(glmnet)
+library(plyr)
+library(coefplot)
+
+# Load the data: remove NA's
+data(Hitters)
+hitters.df = subset(na.omit(Hitters))
+
+# convert the data to a design matrix
+X = model.matrix(Salary ~ 0 + ., hitters.df)
+Y = hitters.df$Salary
+
+# standardize
+X = scale(X)
+Y = scale(Y)
+
+# set random number generator seed for reproducibility
+set.seed(1244)
+
+# create training and test set
+train.ind = sample(nrow(X), round(nrow(X)/2))
+X.train = X[train.ind,]
+X.test = X[-train.ind,]
+Y.train = Y[train.ind]
+Y.test = Y[-train.ind]
+
+# set lambda sequence to use for lasso and ridge
+lambdas = 10^seq(-2,1.5,0.1)
+
+# ridge regression
+fm.ridge = glmnet(X.train, Y.train, alpha = 0, lambda = lambdas, thresh = 1e-12)
+
+# test error of ridge regression at each lambda
+ridge.test = adply(lambdas, 1, function(l) {
+  return( data.frame(l, mean( (Y.test - predict(fm.ridge, s = l, newx = X.test))^2 ), "Ridge" ))
+}, .id = NULL)
+colnames(ridge.test) = c("lambda", "TestErr", "Model")
+
+#lasso
+fm.lasso = glmnet(X.train, Y.train, alpha = 1, lambda = lambdas, thresh = 1e-12)
+
+fm.lasso %>% 
+  summary()
+
+
+cv <- cv.glmnet(X.train, Y.train)
+
+small.lambda.betas <- coef(fm.lasso, s = "lambda.min")
+
+
+cv$lambda.min
+
+extract.coef(cv)
+
+```
+
